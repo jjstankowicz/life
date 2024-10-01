@@ -2,9 +2,13 @@ from pydantic import BaseModel
 from typing import Tuple
 
 import matplotlib.pyplot as plt
-from matplotlib import animation
 from PIL import Image
 import numpy as np
+from scipy.io.wavfile import write
+
+import imageio
+import subprocess
+
 
 GridDimensions = Tuple[int, ...]
 GridLocations = Tuple[GridDimensions, ...]
@@ -15,6 +19,12 @@ class Simulation(BaseModel):
     active_cells: GridLocations = ()
     states: list = []
     state_count: dict = {}
+    sample_rate: int = 44100
+    duration_per_slice: float = 0.1
+    gif_file_path: str = "game_of_life_gif.gif"
+    video_file_path: str = "game_of_life_video.mp4"
+    audio_file_path: str = "game_of_life_audio.wav"
+    output_file_path: str = "game_of_life_audio_video.mp4"
 
     def set_initial_state(self, grid_locations: GridLocations) -> None:
         if isinstance(grid_locations[0], tuple):
@@ -93,7 +103,56 @@ class Simulation(BaseModel):
                 print(self.get_sim_as_text())
                 print("\n")
 
-    def render_gif(self):
+    def generate_sine_wave(self, frequency: float, duration: float) -> np.ndarray:
+        """Generate a sine wave for a given frequency and duration."""
+        t = np.linspace(0, duration, int(self.sample_rate * duration), endpoint=False)
+        return np.sin(2 * np.pi * frequency * t)
+
+    def set_audio(self) -> None:
+        """Map the Game of Life grid to a sound signal and save the audio file."""
+
+        dims = self.grid_dimensions  # (rows, columns) dimensions of the grid
+        num_slices = len(self.states)  # Number of time steps (states)
+
+        # Frequency range (200 Hz to 2000 Hz, for example)
+        freq_range = np.logspace(np.log10(200), np.log10(2000), dims[0])
+
+        time_per_column = self.duration_per_slice / dims[1]  # Time span for each column
+        total_duration = self.duration_per_slice * num_slices  # Total duration of the audio
+        sound = np.zeros(
+            int(self.sample_rate * total_duration)
+        )  # Initialize the entire sound signal
+
+        # Loop over all the states (each time slice)
+        for t, state in enumerate(self.states):  # `t` is the index for time slices
+            slice_start = int(
+                t * self.sample_rate * self.duration_per_slice
+            )  # Start index of this time slice
+
+            # Loop over all active cells in this state
+            for row, col in state:
+                frequency = freq_range[row]  # Map the row to frequency
+                wave = self.generate_sine_wave(
+                    frequency, time_per_column
+                )  # Generate wave for each active cell
+
+                # Determine the correct time offset within the slice
+                start = slice_start + int(col * self.sample_rate * time_per_column)
+                end = start + len(wave)
+
+                # Add the wave to the sound signal (within the current time slice)
+                sound[start:end] += wave
+
+        # Rescale to int16 for audio export
+        audio_signal = np.interp(sound, (-1, 1), (-32767, 32767)).astype(np.int16)
+
+        # Save the audio signal to a WAV file
+        write(self.audio_file_path, self.sample_rate, audio_signal)
+
+        self.audio_file_path  # Return the path to the audio file
+
+    def set_video(self) -> None:
+        """Render the Game of Life states as a GIF and save it as a video."""
         frames = []
         fig, ax = plt.subplots()
 
@@ -116,10 +175,56 @@ class Simulation(BaseModel):
             image = image.reshape(fig.canvas.get_width_height()[::-1] + (3,))
             frames.append(Image.fromarray(image))
 
-        # Save the frames as a GIF
-        frames[0].save(
-            "./temp_sim.gif", save_all=True, append_images=frames[1:], duration=200, loop=0
-        )
+        plt.close(fig)  # Close the plot
+
+        # Save frames as video
+        imageio.mimsave(self.gif_file_path, frames, duration=self.duration_per_slice)
+
+        # Convert the GIF to a video using imageio
+        reader = imageio.get_reader(self.gif_file_path)
+        fps = 1 / self.duration_per_slice
+        writer = imageio.get_writer(self.video_file_path, fps=fps)
+
+        for frame in reader:
+            writer.append_data(frame)
+        writer.close()
+
+    def combine_audio_video(self) -> None:
+        """Use ffmpeg to combine the audio and video into a single file."""
+        # Run ffmpeg command to combine audio and video
+        command = [
+            "ffmpeg",
+            "-y",  # Overwrite output file if exists
+            "-i",
+            self.video_file_path,  # Input video file
+            "-i",
+            self.audio_file_path,  # Input audio file
+            "-c:v",
+            "libx264",  # Use H.264 codec for video
+            "-c:a",
+            "aac",  # Use AAC codec for audio
+            "-crf",
+            "18",  # Lower CRF for higher quality (default is 23)
+            "-g",
+            "10",  # Force a keyframe every 10 frames
+            "-pix_fmt",
+            "yuv420p",  # Ensure compatibility with most players
+            "-shortest",  # Ensure the output matches the shorter stream (audio or video)
+            self.output_file_path,  # Output file
+        ]
+
+        subprocess.run(command)
+
+    def generate_synced_video(self):
+        """Generate the synced video with audio and video combined."""
+        # Render the video
+        self.set_video()
+
+        # Generate the audio
+        self.set_audio()
+
+        # Combine the audio and video
+        self.combine_audio_video()
 
 
 class Rules(BaseModel):
